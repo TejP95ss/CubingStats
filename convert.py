@@ -1,227 +1,435 @@
-import pandas as pd
-import os
-import glob
+r"""
+Solve Analytics Pipeline
+-------------------------
+Parses a cstimer.net export (.txt), computes rolling performance metrics
+(ao5 / ao12 / ao100, consistency stddev), and appends new solves + a
+formatted summary block to an existing Excel workbook.
+
+Usage:
+    python convert.py                     # uses config.json / defaults
+    python convert.py --dry-run           # parse + compute, don't write
+    python convert.py --downloads-dir "D:\Downloads" --excel-path "C:\Cubing.xlsx"
+
+Config:
+    Optional config.json next to this script can fill in the actual paths for the following keys:
+    {
+        "downloads_dir": PATH_TO_DOWNLOADS_DIR,
+        "excel_path": "EXCEL_PATH",
+        "sheet_name": "ACTUAL_NAME",
+        "backup_dir": "BACKUP_DIR_PATH",
+    }
+"""
+
+import argparse
 import ast
+import glob
+import json
+import logging
+import os
+import shutil
+import statistics
+from dataclasses import dataclass
 from datetime import datetime
-from openpyxl.styles import Alignment
-from openpyxl.utils.cell import coordinate_to_tuple
+from typing import List, Optional, Tuple
+
+import pandas as pd
+from openpyxl.styles import Alignment, Border, Font, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font
-from openpyxl.styles import Border, Side
+from openpyxl.utils.cell import coordinate_to_tuple
 import openpyxl
 
-downloads_path = r"C:\Users\tejpa\Downloads"
-file_pattern = os.path.join(downloads_path, "cstimer*.txt")
-matching_files = glob.glob(file_pattern)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("solve_pipeline")
 
-if not matching_files:
-    raise FileNotFoundError("No file starting with 'cstimer' and ending with '.txt' found in Downloads.")
-    
-cstimer_file = matching_files[0]
-with open(cstimer_file, 'r') as file:
-    raw_data = file.read()
-
-session2_index = raw_data.find("session2")
-if session2_index != -1:
-    raw_data = raw_data[:session2_index - 3]
-    raw_data = raw_data + ']}'
-
-data = ast.literal_eval(raw_data)
-
-solves_data = []
-i = 1
-pllDict = {}
-for solve in data["session1"]:
-    time_ms = solve[0][1]
-    pll = solve[2]
-    if pll not in pllDict and len(pll) > 0:
-        pllDict[pll] = 1
-    elif pll in pllDict:
-        pllDict[pll] += 1
-    time_sec = int(time_ms) / 1000.0
-    solves_data.append([i, time_sec, pll])
-    i += 1
+ALIGNMENT = Alignment(horizontal="center", vertical="center")
 
 
-print(pllDict)
-print("Distinct PLLs: ", len(pllDict))
-sum = 0
-for key in pllDict:
-    sum += pllDict[key]
-print("Sum PLLs: ", sum)
+# --------------------------------------------------------------------------- #
+# Config
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Config:
+    downloads_dir: str
+    excel_path: str
+    sheet_name: str
+    backup_dir: Optional[str] = None
+    max_backups: int = 5
 
 
-excel_path = r"C:\Users\tejpa\OneDrive\tej\OneDrive\Cubing.xlsx"
-sheet_name = "MAIN(Start-08-31-2025-Sun)"
+def load_config(args: argparse.Namespace) -> Config:
+    """Merge config.json (if present) with CLI overrides. CLI wins."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    file_cfg = {}
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            file_cfg = json.load(f)
+            log.info(f"Loaded config from {config_path}")
 
-wb = openpyxl.load_workbook(excel_path)
-ws = wb[sheet_name]
-alignment = Alignment(horizontal="center", vertical="center")
+    def pick(cli_val, key, default=None):
+        if cli_val is not None:
+            return cli_val
+        return file_cfg.get(key, default)
+
+    cfg = Config(
+        downloads_dir=pick(args.downloads_dir, "downloads_dir", r"C:\Users\tejpa\Downloads"),
+        excel_path=pick(args.excel_path, "excel_path", r"C:\Users\tejpa\OneDrive\tej\OneDrive\Cubing.xlsx"),
+        sheet_name=pick(args.sheet_name, "sheet_name", "MAIN(Start-08-31-2025-Sun)"),
+        backup_dir=pick(args.backup_dir, "backup_dir", None),
+        max_backups=file_cfg.get("max_backups", 5),
+    )
+    return cfg
 
 
-row = 2
-while ws.cell(row=row, column=1).value is not None:
-    row += 1
+# --------------------------------------------------------------------------- #
+# Parsing
+# --------------------------------------------------------------------------- #
 
-latest_solve_num = solves_data[-1][0]
-latest_solve_num_excel = ws.cell(row=row-1, column=1).value
-number_of_values_to_add = latest_solve_num - latest_solve_num_excel
-if(number_of_values_to_add <= 0):
-    raise Exception("No new values to add!")
+def find_latest_cstimer_export(downloads_dir: str) -> str:
+    pattern = os.path.join(downloads_dir, "cstimer*.txt")
+    matches = glob.glob(pattern)
+    if not matches:
+        raise FileNotFoundError(f"No cstimer*.txt export found in {downloads_dir}")
+    latest = max(matches, key=os.path.getmtime)
+    log.info(f"Using export: {latest}")
+    return latest
 
-#adds the last_n_values to the ws
-def updateExcelFile(wb, ws, last_n_values, row):
-    df = pd.DataFrame(solves_data[-last_n_values:], columns=["Solve Number", 'Time', "PLL"])
-    for r in df.itertuples(index=False):
-        ws.cell(row=row, column=1).value = r[0]
-        ws.cell(row=row, column=2).value = r[1]
-        ws.cell(row=row, column=3).value = r[2]
-        ws.cell(row=row, column=1).alignment = alignment
-        ws.cell(row=row, column=2).alignment = alignment
-        ws.cell(row=row, column=3).alignment = alignment
+
+def extract_session_array(raw: str, session_key: str) -> str:
+    """Pulls out just the `"session_key":[ ... ]` array text via bracket
+    matching (quote-aware), instead of assuming a fixed byte offset around
+    neighboring keys. Works regardless of what other sessions/keys exist,
+    their order, or how cstimer formats the surrounding JSON."""
+    marker = f'"{session_key}"'
+    marker_idx = raw.find(marker)
+    if marker_idx == -1:
+        raise KeyError(f"'{session_key}' not found in export.")
+
+    start = raw.find("[", marker_idx)
+    if start == -1:
+        raise ValueError(f"No array found after '{session_key}' key.")
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_string = False
+            continue
+        if c == '"':
+            in_string = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return raw[start:i + 1]
+
+    raise ValueError(f"Unbalanced brackets while extracting '{session_key}' array.")
+
+
+def parse_cstimer_export(path: str, session_key: str = "session1") -> List[Tuple[int, float, str]]:
+    """Returns list of (solve_number, time_seconds, pll) for the given session."""
+    with open(path, "r") as f:
+        raw = f.read()
+
+    array_str = extract_session_array(raw, session_key)
+
+    try:
+        solves_raw = json.loads(array_str)
+    except json.JSONDecodeError:
+        try:
+            solves_raw = ast.literal_eval(array_str)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"Could not parse '{session_key}' array as JSON or a Python literal: {e}")
+
+    solves = []
+    pll_counts = {}
+    for i, solve in enumerate(solves_raw, start=1):
+        time_ms = solve[0][1]
+        pll = solve[2] if len(solve) > 2 else ""
+        time_sec = int(time_ms) / 1000.0
+        solves.append((i, time_sec, pll))
+        if pll:
+            pll_counts[pll] = pll_counts.get(pll, 0) + 1
+
+    log.info(f"Parsed {len(solves)} solves. Distinct PLLs seen: {len(pll_counts)} "
+              f"(total PLL-tagged solves: {sum(pll_counts.values())})")
+    return solves
+
+
+# --------------------------------------------------------------------------- #
+# Rolling performance metrics
+# --------------------------------------------------------------------------- #
+
+def trimmed_average(window: List[float]) -> Optional[float]:
+    """WCA-style average: drop best/worst ~5% (min 1), average the rest.
+    DNFs aren't modeled here since cstimer times are already in seconds."""
+    n = len(window)
+    if n < 3:
+        return None
+    trim = max(1, round(n * 0.05))
+    trimmed = sorted(window)[trim:n - trim]
+    if not trimmed:
+        return None
+    return sum(trimmed) / len(trimmed)
+
+
+def rolling_metrics(all_times: List[float], upto_index: int) -> dict:
+    """Computes ao5 / ao12 / ao100 / stdev100 ending at solve index `upto_index`
+    (1-indexed, inclusive) using the full time history."""
+    window = all_times[:upto_index]
+
+    def avg_last(n):
+        return round(trimmed_average(window[-n:]), 3) if len(window) >= n else None
+
+    stdev100 = None
+    if len(window) >= 100:
+        stdev100 = round(statistics.pstdev(window[-100:]), 3)
+
+    return {
+        "ao5": avg_last(5),
+        "ao12": avg_last(12),
+        "ao100": avg_last(100),
+        "consistency_stdev100": stdev100,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Excel I/O
+# --------------------------------------------------------------------------- #
+
+def backup_workbook(excel_path: str, backup_dir: Optional[str], max_backups: int) -> None:
+    if not backup_dir:
+        backup_dir = os.path.join(os.path.dirname(excel_path), "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = os.path.splitext(os.path.basename(excel_path))[0]
+    dest = os.path.join(backup_dir, f"{base}_{stamp}.xlsx")
+    shutil.copy2(excel_path, dest)
+    log.info(f"Backup written to {dest}")
+
+    backups = sorted(glob.glob(os.path.join(backup_dir, f"{base}_*.xlsx")), key=os.path.getmtime)
+    for old in backups[:-max_backups]:
+        os.remove(old)
+        log.info(f"Pruned old backup {old}")
+
+
+def find_last_filled_row(ws, col: int = 1, start_row: int = 2) -> int:
+    row = start_row
+    while ws.cell(row=row, column=col).value is not None:
         row += 1
-    wb.save(excel_path)
-    print(f"Data appended to {excel_path} in sheet '{sheet_name}'.")
+    return row  # first empty row
 
-#returns the next cell that is empty so that data can be added there
-def findNextCell(ws, top_left, top_right):
-    col_inc = findColInc(ws, top_left)
-    row_inc = findRowInc(ws, top_left)
 
-    row, col_number = coordinate_to_tuple(top_left)
-    while ws[f"{get_column_letter(col_number)}{row}"].value is not None:
-        row += row_inc
-    
-    row -= row_inc
-    while ws[f"{get_column_letter(col_number)}{row}"].value is not None:
-        col_number += col_inc
+def append_solves(ws, solves_data: List[Tuple[int, float, str]], start_row: int, new_count: int) -> None:
+    """Writes Solve Number / Time / PLL / ao5 / ao12 / ao100 / StdDev(100) for
+    the newest `new_count` solves, using the full history for rolling calcs."""
+    all_times = [t for _, t, _ in solves_data]
+    batch = solves_data[-new_count:]
 
-    _, tr_col_number = coordinate_to_tuple(top_right)
-    if(tr_col_number < col_number):
-        _, tl_col_number = coordinate_to_tuple(top_left)
-        col_number = tl_col_number
-        row += row_inc
+    row = start_row
+    for solve_num, time_sec, pll in batch:
+        metrics = rolling_metrics(all_times, solve_num)
+        values = [solve_num, time_sec, pll,
+                  metrics["ao5"], metrics["ao12"], metrics["ao100"], metrics["consistency_stdev100"]]
+        for col_offset, val in enumerate(values, start=1):
+            cell = ws.cell(row=row, column=col_offset)
+            cell.value = val
+            cell.alignment = ALIGNMENT
+            if col_offset >= 4 and val is not None:
+                cell.number_format = "0.000"
+        row += 1
+    log.info(f"Appended {new_count} solves (rows {start_row}-{row - 1}), with ao5/ao12/ao100/stdev.")
 
-    return f"{get_column_letter(col_number)}{row}"
 
-#find the column increment
-def findColInc(ws, top_left):
-    row, original_col_number = coordinate_to_tuple(top_left)
-    col_number = original_col_number + 1
-    while(True):
-        cv = ws[f"{get_column_letter(col_number)}{row}"].value
-        if(cv is not None and isinstance(cv, str) and cv.lower().endswith("day")):
-            break
-        col_number += 1
-    return col_number - original_col_number
-    
-#find the row increment
-def findRowInc(ws, top_left):
-    original_row, col_number = coordinate_to_tuple(top_left)
-    row_number = original_row + 1
-    while(True):
-        cv = ws[f"{get_column_letter(col_number)}{row_number}"].value
-        if(cv is not None and isinstance(cv, str) and cv.lower().endswith("day")):
-            break
-        row_number += 1
-    return row_number - original_row
-   
-#easier way to change the value and also format the size, font, and alignment
-def changeCellValue(cell, value, size, bold):
+def change_cell(cell, value, size, bold):
     cell.value = value
     cell.font = Font(name="Aptos Narrow", size=size, bold=bold)
-    cell.alignment = alignment
+    cell.alignment = ALIGNMENT
 
-#adds the various averages, medians, counts for the given batch of data
-def addData(latest_solve_num_excel, number_of_values_to_add, dateCell):
-    latest_solve_num_excel += 2
-    last_cell = latest_solve_num_excel + number_of_values_to_add - 1
-    range_of_values = f"B{latest_solve_num_excel}:B{last_cell}"
 
-    row, start_col = coordinate_to_tuple(dateCell)
-    end_col = start_col + 2
-    start_col_letter = get_column_letter(start_col)
-    end_col_letter = get_column_letter(end_col)
+def relative_cell(top_left: str, row_offset: int, col_offset: int) -> str:
+    row, col = coordinate_to_tuple(top_left)
+    return f"{get_column_letter(col + col_offset)}{row + row_offset}"
 
-    top_row_range = f"{start_col_letter}{row}:{end_col_letter}{row}"
-    second_row_range = f"{start_col_letter}{row + 1}:{end_col_letter}{row + 1}"
 
-    ws.merge_cells(top_row_range)
-    ws.merge_cells(second_row_range)
-
-    count_cell = returnRelativeCell(dateCell, 11, 1)
-
-    add_thick_border(ws, f"{dateCell}:{returnRelativeCell(dateCell, 14, 2)}")
-    changeCellValue(ws[dateCell], datetime.today().strftime("%m/%d/%Y/%A")  , 12, True)
-    changeCellValue(ws[returnRelativeCell(dateCell, 1, 0)], "OVERALL STATS", 12, True)
-    for i in range(6):
-        value = 15 + i
-        changeCellValue(ws[returnRelativeCell(dateCell, 3 + i, 0)], f"Sub {value}", 12, True)
-    changeCellValue(ws[returnRelativeCell(dateCell, 9, 0)], "Above 25", 12, True)
-    for i in range(6):
-        value = 15 + i
-        changeCellValue(ws[returnRelativeCell(dateCell, 3 + i, 1)], f'=COUNTIF({range_of_values}, "<={value}")', 11, False)
-    changeCellValue(ws[returnRelativeCell(dateCell, 9, 1)], f"=COUNTIF({range_of_values}, \">=25\")", 11, False)
-    for i in range(7):
-        changeCellValue(ws[returnRelativeCell(dateCell, 3 + i, 2)], f"=({returnRelativeCell(dateCell, 3 + i, 1)}/{count_cell}) * 100", 11, False)
-
-    changeCellValue(ws[returnRelativeCell(dateCell, 2, 1)], "Solves", 12, True)
-    changeCellValue(ws[returnRelativeCell(dateCell, 2, 2)], "Percent", 12, True)
-
-    for i in range(4):
-        titles = ["Total", "Hours Solving", "Avg Time", "Median Time"]
-        formulas = [f"=COUNT({range_of_values})", f"=SUM({range_of_values}) / 60 / 60", f"=SUM({range_of_values})/{count_cell}", f"=MEDIAN({range_of_values})"]
-        changeCellValue(ws[returnRelativeCell(dateCell, 11 + i, 0)], titles[i], 12, True)
-        changeCellValue(ws[returnRelativeCell(dateCell, 11 + i, 1)], formulas[i], 11, False)
-
-    ws[returnRelativeCell(dateCell, 12, 1)].number_format = '0.000'
-    ws[returnRelativeCell(dateCell, 13, 1)].number_format = '0.000'
-    for i in range(7):
-        ws[returnRelativeCell(dateCell, 3 + i, 2)].number_format = '0.00'
-
-    wb.save(excel_path)
-    print(f"Data added to {excel_path} in sheet '{sheet_name}'.")
-    return 0
-
-#adds a thick ourside border around a block of cells
-def add_thick_border(ws, cell_range):
+def add_thick_border(ws, cell_range: str) -> None:
     thick = Side(border_style="thick", color="000000")
-    
     start_cell, end_cell = cell_range.split(":")
-    _, start_row = ''.join(filter(str.isalpha, start_cell)), int(''.join(filter(str.isdigit, start_cell)))
-    _, end_row = ''.join(filter(str.isalpha, end_cell)), int(''.join(filter(str.isdigit, end_cell)))
-    
+    start_row = int("".join(filter(str.isdigit, start_cell)))
+    end_row = int("".join(filter(str.isdigit, end_cell)))
     _, start_col = coordinate_to_tuple(start_cell)
     _, end_col = coordinate_to_tuple(end_cell)
 
     for row in range(start_row, end_row + 1):
         for col in range(start_col, end_col + 1):
-            cell = ws[f"{get_column_letter(col)}{row}"]
-
-            border_sides = {
-                "top": thick if row == start_row else None,
-                "bottom": thick if row == end_row else None,
-                "left": thick if col == start_col else None,
-                "right": thick if col == end_col else None,
-            }
-
+            cell = ws.cell(row=row, column=col)
             cell.border = Border(
-                top=border_sides["top"] or cell.border.top,
-                bottom=border_sides["bottom"] or cell.border.bottom,
-                left=border_sides["left"] or cell.border.left,
-                right=border_sides["right"] or cell.border.right
+                top=thick if row == start_row else cell.border.top,
+                bottom=thick if row == end_row else cell.border.bottom,
+                left=thick if col == start_col else cell.border.left,
+                right=thick if col == end_col else cell.border.right,
             )
 
-def returnRelativeCell(top_left, row_offset, col_offset):
+
+def find_col_increment(ws, top_left: str) -> int:
+    row, orig_col = coordinate_to_tuple(top_left)
+    col = orig_col + 1
+    while True:
+        v = ws.cell(row=row, column=col).value
+        if isinstance(v, str) and v.lower().endswith("day"):
+            return col - orig_col
+        col += 1
+
+
+def find_row_increment(ws, top_left: str) -> int:
+    orig_row, col = coordinate_to_tuple(top_left)
+    row = orig_row + 1
+    while True:
+        v = ws.cell(row=row, column=col).value
+        if isinstance(v, str) and v.lower().endswith("day"):
+            return row - orig_row
+        row += 1
+
+
+def find_next_summary_block(ws, top_left: str, top_right: str) -> str:
+    col_inc = find_col_increment(ws, top_left)
+    row_inc = find_row_increment(ws, top_left)
     row, col = coordinate_to_tuple(top_left)
-    row += row_offset
-    col += col_offset
+
+    while ws.cell(row=row, column=col).value is not None:
+        row += row_inc
+    row -= row_inc
+    while ws.cell(row=row, column=col).value is not None:
+        col += col_inc
+
+    _, tr_col = coordinate_to_tuple(top_right)
+    if tr_col < col:
+        _, tl_col = coordinate_to_tuple(top_left)
+        col = tl_col
+        row += row_inc
+
     return f"{get_column_letter(col)}{row}"
 
-##running the below two functions will update the excel file. Without it, only basic data like pll, sum plls will show
-updateExcelFile(wb, ws, number_of_values_to_add, row)
-addData(latest_solve_num_excel, number_of_values_to_add, findNextCell(ws, "AN8", "BD8"))
-#venv/scripts/activate
-#python convert.py
+
+def write_summary_block(ws, excel_start_row_before_append: int, new_count: int, date_cell: str) -> None:
+    """Writes the OVERALL STATS block (bucketed counts, totals, avg/median)
+    for the batch of solves just appended."""
+    first_data_row = excel_start_row_before_append + 2
+    last_data_row = first_data_row + new_count - 1
+    value_range = f"B{first_data_row}:B{last_data_row}"
+
+    row, start_col = coordinate_to_tuple(date_cell)
+    end_col = start_col + 2
+    ws.merge_cells(f"{get_column_letter(start_col)}{row}:{get_column_letter(end_col)}{row}")
+    ws.merge_cells(f"{get_column_letter(start_col)}{row + 1}:{get_column_letter(end_col)}{row + 1}")
+
+    count_cell = relative_cell(date_cell, 11, 1)
+    add_thick_border(ws, f"{date_cell}:{relative_cell(date_cell, 14, 2)}")
+
+    change_cell(ws[date_cell], datetime.today().strftime("%m/%d/%Y/%A"), 12, True)
+    change_cell(ws[relative_cell(date_cell, 1, 0)], "OVERALL STATS", 12, True)
+
+    for i in range(6):
+        threshold = 15 + i
+        change_cell(ws[relative_cell(date_cell, 3 + i, 0)], f"Sub {threshold}", 12, True)
+        change_cell(ws[relative_cell(date_cell, 3 + i, 1)],
+                    f'=COUNTIF({value_range}, "<={threshold}")', 11, False)
+
+    change_cell(ws[relative_cell(date_cell, 9, 0)], "Above 25", 12, True)
+    change_cell(ws[relative_cell(date_cell, 9, 1)], f'=COUNTIF({value_range}, ">=25")', 11, False)
+
+    change_cell(ws[relative_cell(date_cell, 2, 1)], "Solves", 12, True)
+    change_cell(ws[relative_cell(date_cell, 2, 2)], "Percent", 12, True)
+
+    for i in range(7):
+        pct_cell = relative_cell(date_cell, 3 + i, 2)
+        change_cell(ws[pct_cell], f"=({relative_cell(date_cell, 3 + i, 1)}/{count_cell}) * 100", 11, False)
+        ws[pct_cell].number_format = "0.00"
+
+    titles = ["Total", "Hours Solving", "Avg Time", "Median Time"]
+    formulas = [
+        f"=COUNT({value_range})",
+        f"=SUM({value_range}) / 60 / 60",
+        f"=SUM({value_range})/{count_cell}",
+        f"=MEDIAN({value_range})",
+    ]
+    for i, (title, formula) in enumerate(zip(titles, formulas)):
+        change_cell(ws[relative_cell(date_cell, 11 + i, 0)], title, 12, True)
+        change_cell(ws[relative_cell(date_cell, 11 + i, 1)], formula, 11, False)
+
+    ws[relative_cell(date_cell, 12, 1)].number_format = "0.000"
+    ws[relative_cell(date_cell, 13, 1)].number_format = "0.000"
+
+    log.info(f"Summary block written at {date_cell}.")
 
 
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync cstimer export into Cubing.xlsx with rolling stats.")
+    parser.add_argument("--downloads-dir", default=None)
+    parser.add_argument("--excel-path", default=None)
+    parser.add_argument("--sheet-name", default=None)
+    parser.add_argument("--backup-dir", default=None)
+    parser.add_argument("--dry-run", action="store_true", help="Parse + compute stats, skip writing/saving.")
+    args = parser.parse_args()
+
+    cfg = load_config(args)
+
+    export_path = find_latest_cstimer_export(cfg.downloads_dir)
+    solves_data = parse_cstimer_export(export_path)
+
+    if not solves_data:
+        log.warning("No solves parsed from export. Nothing to do.")
+        return
+
+    if not os.path.exists(cfg.excel_path):
+        raise FileNotFoundError(f"Excel workbook not found: {cfg.excel_path}")
+
+    wb = openpyxl.load_workbook(cfg.excel_path)
+    ws = wb[cfg.sheet_name]
+
+    next_empty_row = find_last_filled_row(ws)
+    latest_excel_solve_num = ws.cell(row=next_empty_row - 1, column=1).value or 0
+    latest_parsed_solve_num = solves_data[-1][0]
+    new_count = latest_parsed_solve_num - latest_excel_solve_num
+
+    if new_count <= 0:
+        log.info("Workbook is already up to date. No new solves to add.")
+        return
+
+    log.info(f"{new_count} new solve(s) to add (solve #{latest_excel_solve_num + 1} "
+              f"through #{latest_parsed_solve_num}).")
+
+    if args.dry_run:
+        preview = rolling_metrics([t for _, t, _ in solves_data], latest_parsed_solve_num)
+        log.info(f"[DRY RUN] Would append {new_count} rows. Latest rolling stats: {preview}")
+        return
+
+    backup_workbook(cfg.excel_path, cfg.backup_dir, cfg.max_backups)
+
+    append_solves(ws, solves_data, next_empty_row, new_count)
+    summary_anchor = find_next_summary_block(ws, "AN8", "BD8")
+    write_summary_block(ws, latest_excel_solve_num, new_count, summary_anchor)
+
+    wb.save(cfg.excel_path)
+    log.info(f"Saved {cfg.excel_path}.")
+
+
+if __name__ == "__main__":
+    main()
