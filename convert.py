@@ -16,7 +16,6 @@ Config:
         "downloads_dir": PATH_TO_DOWNLOADS_DIR,
         "excel_path": "EXCEL_PATH",
         "sheet_name": "ACTUAL_NAME",
-        "backup_dir": "BACKUP_DIR_PATH",
     }
 """
 
@@ -57,8 +56,6 @@ class Config:
     downloads_dir: str
     excel_path: str
     sheet_name: str
-    backup_dir: Optional[str] = None
-    max_backups: int = 5
 
 
 def load_config(args: argparse.Namespace) -> Config:
@@ -79,8 +76,6 @@ def load_config(args: argparse.Namespace) -> Config:
         downloads_dir=pick(args.downloads_dir, "downloads_dir", r"C:\Users\tejpa\Downloads"),
         excel_path=pick(args.excel_path, "excel_path", r"C:\Users\tejpa\OneDrive\tej\OneDrive\Cubing.xlsx"),
         sheet_name=pick(args.sheet_name, "sheet_name", "MAIN(Start-08-31-2025-Sun)"),
-        backup_dir=pick(args.backup_dir, "backup_dir", None),
-        max_backups=file_cfg.get("max_backups", 5),
     )
     return cfg
 
@@ -449,7 +444,6 @@ def main():
     parser.add_argument("--downloads-dir", default=None)
     parser.add_argument("--excel-path", default=None)
     parser.add_argument("--sheet-name", default=None)
-    parser.add_argument("--backup-dir", default=None)
     parser.add_argument("--dry-run", action="store_true", help="Parse + compute stats, skip writing/saving.")
     args = parser.parse_args()
 
