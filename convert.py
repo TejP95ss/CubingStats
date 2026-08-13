@@ -209,23 +209,6 @@ def rolling_metrics(all_times: List[float], upto_index: int) -> dict:
 # Excel I/O
 # --------------------------------------------------------------------------- #
 
-def backup_workbook(excel_path: str, backup_dir: Optional[str], max_backups: int) -> None:
-    if not backup_dir:
-        backup_dir = os.path.join(os.path.dirname(excel_path), "backups")
-    os.makedirs(backup_dir, exist_ok=True)
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = os.path.splitext(os.path.basename(excel_path))[0]
-    dest = os.path.join(backup_dir, f"{base}_{stamp}.xlsx")
-    shutil.copy2(excel_path, dest)
-    log.info(f"Backup written to {dest}")
-
-    backups = sorted(glob.glob(os.path.join(backup_dir, f"{base}_*.xlsx")), key=os.path.getmtime)
-    for old in backups[:-max_backups]:
-        os.remove(old)
-        log.info(f"Pruned old backup {old}")
-
-
 def find_last_filled_row(ws, col: int = 1, start_row: int = 2) -> int:
     row = start_row
     while ws.cell(row=row, column=col).value is not None:
@@ -252,6 +235,87 @@ def append_solves(ws, solves_data: List[Tuple[int, float, str]], start_row: int,
                 cell.number_format = "0.000"
         row += 1
     log.info(f"Appended {new_count} solves (rows {start_row}-{row - 1}), with ao5/ao12/ao100/stdev.")
+
+def fill_missing_rolling_metrics(ws, start_row: int = 2) -> int:
+    """
+    Fills missing Ao5, Ao12, Ao100, and 100-solve rolling population
+    standard deviation values for every solve already present in Excel.
+
+    Columns:
+        A = Solve Number
+        B = Time
+        D = Ao5
+        E = Ao12
+        F = Ao100
+        G = 100-solve StdDev
+
+    Existing metric values are NOT overwritten.
+    The first 4 solves are skipped for Ao5, the first 11 for Ao12,
+    and the first 99 for Ao100/stddev because there is not enough data.
+    """
+    # Read all solve times from Excel.
+    times = []
+    rows = []
+
+    row = start_row
+    while ws.cell(row=row, column=1).value is not None:
+        solve_num = ws.cell(row=row, column=1).value
+        time_sec = ws.cell(row=row, column=2).value
+
+        if solve_num is not None and time_sec is not None:
+            rows.append((row, solve_num, float(time_sec)))
+            times.append(float(time_sec))
+
+        row += 1
+
+    filled_count = 0
+
+    for index, (excel_row, solve_num, time_sec) in enumerate(rows):
+        # index is 0-based, so:
+        # solve 5  -> index 4
+        # solve 12 -> index 11
+        # solve 100 -> index 99
+        history = times[:index + 1]
+
+        metrics = {
+            "ao5": None,
+            "ao12": None,
+            "ao100": None,
+            "consistency_stdev100": None,
+        }
+
+        if len(history) >= 5:
+            metrics["ao5"] = round(trimmed_average(history[-5:]), 3)
+
+        if len(history) >= 12:
+            metrics["ao12"] = round(trimmed_average(history[-12:]), 3)
+
+        if len(history) >= 100:
+            metrics["ao100"] = round(trimmed_average(history[-100:]), 3)
+            metrics["consistency_stdev100"] = round(
+                statistics.pstdev(history[-100:]), 3
+            )
+
+        values = [
+            metrics["ao5"],
+            metrics["ao12"],
+            metrics["ao100"],
+            metrics["consistency_stdev100"],
+        ]
+
+        # Columns D:G
+        for col, value in zip(range(4, 8), values):
+            cell = ws.cell(row=excel_row, column=col)
+
+            # Only fill genuinely missing cells.
+            if cell.value is None and value is not None:
+                cell.value = value
+                cell.alignment = ALIGNMENT
+                cell.number_format = "0.000"
+                filled_count += 1
+
+    log.info(f"Filled {filled_count} missing rolling metric cells.")
+    return filled_count
 
 
 def change_cell(cell, value, size, bold):
@@ -421,9 +485,8 @@ def main():
         log.info(f"[DRY RUN] Would append {new_count} rows. Latest rolling stats: {preview}")
         return
 
-    backup_workbook(cfg.excel_path, cfg.backup_dir, cfg.max_backups)
-
     append_solves(ws, solves_data, next_empty_row, new_count)
+    fill_missing_rolling_metrics(ws)
     summary_anchor = find_next_summary_block(ws, "AN8", "BD8")
     write_summary_block(ws, latest_excel_solve_num, new_count, summary_anchor)
 
